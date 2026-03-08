@@ -4,7 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 // ─── Config ───────────────────────────────────────────────────────────────────
 const AI_MODEL = "claude-haiku-4-5-20251001";
 const FACEBOOK_API_VERSION = "v19.0";
-const RAPIDAPI_HOST = "hotels-com-provider.p.rapidapi.com";
+const RAPIDAPI_HOST = "booking-com.p.rapidapi.com";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface HotelDeal {
@@ -37,25 +37,21 @@ function buildAffiliateLink(
   return `https://www.expedia.com/Hotel-Search?destination=${dest}&startDate=${checkIn}&endDate=${checkOut}&AFFCID=${affiliateId}`;
 }
 
-// ─── Hotel Search ─────────────────────────────────────────────────────────────
-async function getRegionId(
+// ─── Hotel Search (Booking.com API) ───────────────────────────────────────────
+async function getDestination(
   location: string,
   apiKey: string
-): Promise<string | null> {
+): Promise<{ destId: string; destType: string } | null> {
   const searchTerms = [
     location,
     location.split(",")[0].trim(),
-    location.split(",")[0].trim() + " AL",
-    location.split(",")[0].trim() + " Gulf",
   ];
 
   for (const term of searchTerms) {
     try {
-      logger.log(`Trying region search: "${term}"`);
+      logger.log(`Trying destination search: "${term}"`);
       const res = await fetch(
-        `https://${RAPIDAPI_HOST}/v2/regions?query=${encodeURIComponent(
-          term
-        )}&locale=en_US&siteid=300000001`,
+        `https://${RAPIDAPI_HOST}/v1/hotels/locations?name=${encodeURIComponent(term)}&locale=en-us`,
         {
           headers: {
             "X-RapidAPI-Key": apiKey,
@@ -64,49 +60,53 @@ async function getRegionId(
         }
       );
       if (!res.ok) {
-        // Log the actual error so we can debug it
         const errBody = await res.text().catch(() => "");
-        logger.warn(
-          `Region API HTTP ${res.status} for "${term}": ${errBody.slice(0, 300)}`
-        );
+        logger.warn(`Booking.com location API HTTP ${res.status} for "${term}": ${errBody.slice(0, 300)}`);
         continue;
       }
       const data = await res.json();
-      const regions: any[] = data?.data ?? [];
-      logger.log(`Region results for "${term}": ${regions.length} found`);
-      if (regions.length > 0) {
-        logger.log(`First result: type=${regions[0]?.type} gaiaId=${regions[0]?.gaiaId}`);
-      }
-      const region =
-        regions.find(
-          (r: any) =>
-            r.type === "CITY" ||
-            r.type === "NEIGHBORHOOD" ||
-            r.type === "AIRPORT"
-        ) ?? regions[0];
-      if (region?.gaiaId) {
-        logger.log(`Found region ID: ${region.gaiaId} for "${term}"`);
-        return region.gaiaId;
+      const results: any[] = Array.isArray(data) ? data : [];
+      logger.log(`Location results for "${term}": ${results.length} found`);
+
+      // Prefer city type, fall back to first result
+      const match =
+        results.find((r: any) => r.dest_type === "city") ?? results[0];
+
+      if (match?.dest_id) {
+        logger.log(`Found destination: id=${match.dest_id} type=${match.dest_type} name=${match.name}`);
+        return { destId: String(match.dest_id), destType: match.dest_type };
       }
     } catch (e) {
-      logger.warn(`Region search failed for "${term}": ${e}`);
+      logger.warn(`Destination search failed for "${term}": ${e}`);
     }
   }
   return null;
 }
 
 async function searchHotels(
-  regionId: string,
+  destId: string,
+  destType: string,
   checkIn: string,
   checkOut: string,
   apiKey: string
 ): Promise<any[]> {
   try {
-    const url =
-      `https://${RAPIDAPI_HOST}/v2/hotels/search` +
-      `?regionId=${regionId}&locale=en_US&siteid=300000001` +
-      `&checkIn=${checkIn}&checkOut=${checkOut}` +
-      `&adults=2&rooms=1&resultsSize=15&sort=PRICE_LOW_TO_HIGH&currency=USD`;
+    const params = new URLSearchParams({
+      dest_id: destId,
+      dest_type: destType,
+      checkin_date: checkIn,
+      checkout_date: checkOut,
+      adults_number: "2",
+      room_number: "1",
+      order_by: "price",
+      locale: "en-us",
+      currency: "USD",
+      units: "metric",
+      filter_by_currency: "USD",
+      page_number: "0",
+      include_adjacency: "true",
+    });
+    const url = `https://${RAPIDAPI_HOST}/v1/hotels/search?${params}`;
     const res = await fetch(url, {
       headers: {
         "X-RapidAPI-Key": apiKey,
@@ -119,7 +119,7 @@ async function searchHotels(
       return [];
     }
     const data = await res.json();
-    return data?.properties ?? [];
+    return data?.result ?? [];
   } catch (e) {
     logger.warn(`Hotel search failed: ${e}`);
     return [];
@@ -162,7 +162,7 @@ Hotel deal:
 - Hotel: ${deal.name}
 - Price: $${deal.price}/night
 ${savings ? `- Savings: ${savings}` : ""}
-${deal.rating ? `- Rating: ${deal.rating}/5 (${deal.reviewCount?.toLocaleString()} reviews)` : ""}
+${deal.rating ? `- Rating: ${deal.rating}/10 (${deal.reviewCount?.toLocaleString()} reviews)` : ""}
 ${deal.amenities.length > 0 ? `- Amenities: ${deal.amenities.slice(0, 4).join(", ")}` : ""}
 - Booking link: ${deal.affiliateLink}
 
@@ -280,17 +280,16 @@ async function runBotForLocation(location: string): Promise<void> {
 
   logger.log(`Searching hotels for ${location}`, { checkIn, checkOut });
 
-  // 1. Get region ID
-  const regionId = await getRegionId(location, rapidApiKey);
-  if (!regionId) {
-    logger.warn(`Could not find region ID for: ${location} — falling back to generic discovery post`);
+  // 1. Get destination ID
+  const destination = await getDestination(location, rapidApiKey);
+  if (!destination) {
+    logger.warn(`Could not find destination for: ${location} — falling back to generic discovery post`);
     await postGenericDiscovery(location, checkIn, checkOut, affId, aiClient, fbPageId, fbToken);
     return;
   }
-  logger.log(`Region ID: ${regionId}`);
 
   // 2. Search hotels
-  const hotels = await searchHotels(regionId, checkIn, checkOut, rapidApiKey);
+  const hotels = await searchHotels(destination.destId, destination.destType, checkIn, checkOut, rapidApiKey);
   if (hotels.length === 0) {
     logger.warn(`No hotels found for ${location} — falling back to generic discovery post`);
     await postGenericDiscovery(location, checkIn, checkOut, affId, aiClient, fbPageId, fbToken);
@@ -298,25 +297,20 @@ async function runBotForLocation(location: string): Promise<void> {
   }
   logger.log(`Found ${hotels.length} hotels`);
 
-  // 3. Pick the best deal — lowest price with a rating ≥ 3.5
+  // 3. Pick the best deal — lowest price with a rating ≥ 7 (Booking.com scores out of 10)
   const rated = hotels.filter(
-    (h: any) => h.price?.lead?.amount && (h.reviews?.score ?? 0) >= 3.5
+    (h: any) => h.min_total_price && (h.review_score ?? 0) >= 7
   );
   const best = rated.length > 0
-    ? rated.sort((a: any, b: any) => a.price.lead.amount - b.price.lead.amount)[0]
-    : hotels[0];
+    ? rated.sort((a: any, b: any) => a.min_total_price - b.min_total_price)[0]
+    : hotels.sort((a: any, b: any) => (a.min_total_price ?? 999999) - (b.min_total_price ?? 999999))[0];
 
   const deal: HotelDeal = {
-    name: best.name ?? "Featured Hotel",
-    price: Math.round(best.price?.lead?.amount ?? 0),
-    originalPrice: best.price?.strikeThrough?.amount
-      ? Math.round(best.price.strikeThrough.amount)
-      : undefined,
-    rating: best.reviews?.score,
-    reviewCount: best.reviews?.total,
-    amenities: (best.amenities ?? [])
-      .slice(0, 5)
-      .map((a: any) => (typeof a === "string" ? a : a.text ?? "")),
+    name: best.hotel_name ?? "Featured Hotel",
+    price: Math.round(best.min_total_price ?? 0),
+    rating: best.review_score,
+    reviewCount: best.review_nr,
+    amenities: [],
     affiliateLink: buildAffiliateLink(location, checkIn, checkOut, affId),
   };
 
