@@ -249,8 +249,35 @@ Output only the post text. Nothing else.`;
 async function postToFacebook(
   text: string,
   fbPageId: string,
-  fbToken: string
+  fbToken: string,
+  photoUrl?: string | null
 ): Promise<string> {
+  // If we have a photo URL, post via /photos endpoint (shows image in post)
+  if (photoUrl) {
+    logger.log(`Posting with photo: ${photoUrl}`);
+    const res = await fetch(
+      `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${fbPageId}/photos`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: photoUrl,
+          caption: text,
+          access_token: fbToken,
+        }),
+      }
+    );
+    if (!res.ok) {
+      const err = await res.text();
+      logger.warn(`Photo post failed (${res.status}): ${err.slice(0, 200)} — falling back to text-only`);
+      // Fall through to text-only post below
+    } else {
+      const data = await res.json();
+      return data.post_id ?? data.id;
+    }
+  }
+
+  // Text-only fallback
   const res = await fetch(
     `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${fbPageId}/feed`,
     {
@@ -270,8 +297,8 @@ async function postToFacebook(
   return data.id;
 }
 
-// ─── Extract price and rating from DataCrawler hotel object ───────────────────
-function extractHotelData(h: any): { price: number; rating: number; reviewCount: number } {
+// ─── Extract price, rating, and photo from DataCrawler hotel object ──────────
+function extractHotelData(h: any): { price: number; rating: number; reviewCount: number; photoUrl: string | null } {
   const price =
     h.property?.priceBreakdown?.grossPrice?.value ??
     h.property?.priceBreakdown?.strikethroughPrice?.value ??
@@ -292,7 +319,19 @@ function extractHotelData(h: any): { price: number; rating: number; reviewCount:
     h.reviewCount ??
     0;
 
-  return { price: Math.round(price), rating, reviewCount };
+  // Try every known field name DataCrawler uses for photos
+  const photoUrl =
+    h.property?.photoUrls?.[0] ??
+    h.property?.mainPhoto?.highResUrl ??
+    h.property?.mainPhoto?.lowResUrl ??
+    h.property?.mainPhoto?.url ??
+    h.photoUrls?.[0] ??
+    h.mainPhoto?.highResUrl ??
+    h.mainPhoto?.url ??
+    h.photo?.url ??
+    null;
+
+  return { price: Math.round(price), rating, reviewCount, photoUrl };
 }
 
 // ─── Shared Run Logic ─────────────────────────────────────────────────────────
@@ -335,8 +374,10 @@ async function runBotForLocation(location: string): Promise<void> {
   const pool = rated.length > 0 ? rated : withPrice;
   const best = pool.sort((a: any, b: any) => extractHotelData(a).price - extractHotelData(b).price)[0];
 
-  const { price, rating, reviewCount } = extractHotelData(best);
+  const { price, rating, reviewCount, photoUrl } = extractHotelData(best);
   const name = best.property?.name ?? best.hotel_name ?? best.name ?? "Featured Hotel";
+
+  logger.log(`Photo URL found: ${photoUrl ?? "none"}`);
 
   const deal: HotelDeal = {
     name,
@@ -353,9 +394,9 @@ async function runBotForLocation(location: string): Promise<void> {
   const postText = await generateFacebookPost(deal, location, aiClient);
   logger.log("Generated post text", { postText });
 
-  // 5. Post to Facebook
-  const postId = await postToFacebook(postText, fbPageId, fbToken);
-  logger.log(`✅ Posted to Facebook`, { postId, location });
+  // 5. Post to Facebook (with photo if available)
+  const postId = await postToFacebook(postText, fbPageId, fbToken, photoUrl);
+  logger.log(`✅ Posted to Facebook`, { postId, location, hasPhoto: !!photoUrl });
 }
 
 // ─── Scheduled Tasks ──────────────────────────────────────────────────────────
