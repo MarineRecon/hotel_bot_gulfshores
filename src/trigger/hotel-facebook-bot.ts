@@ -4,7 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 // ─── Config ───────────────────────────────────────────────────────────────────
 const AI_MODEL = "claude-haiku-4-5-20251001";
 const FACEBOOK_API_VERSION = "v19.0";
-const RAPIDAPI_HOST = "booking-com.p.rapidapi.com";
+const RAPIDAPI_HOST = "booking-com15.p.rapidapi.com";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface HotelDeal {
@@ -37,11 +37,11 @@ function buildAffiliateLink(
   return `https://www.expedia.com/Hotel-Search?destination=${dest}&startDate=${checkIn}&endDate=${checkOut}&AFFCID=${affiliateId}`;
 }
 
-// ─── Hotel Search (Booking.com API) ───────────────────────────────────────────
+// ─── Hotel Search (Booking COM by DataCrawler — booking-com15.p.rapidapi.com) ─
 async function getDestination(
   location: string,
   apiKey: string
-): Promise<{ destId: string; destType: string } | null> {
+): Promise<{ destId: string; searchType: string } | null> {
   const searchTerms = [
     location,
     location.split(",")[0].trim(),
@@ -51,7 +51,7 @@ async function getDestination(
     try {
       logger.log(`Trying destination search: "${term}"`);
       const res = await fetch(
-        `https://${RAPIDAPI_HOST}/v1/hotels/locations?name=${encodeURIComponent(term)}&locale=en-us`,
+        `https://${RAPIDAPI_HOST}/api/v1/hotels/searchDestination?query=${encodeURIComponent(term)}&languagecode=en-us`,
         {
           headers: {
             "X-RapidAPI-Key": apiKey,
@@ -61,20 +61,28 @@ async function getDestination(
       );
       if (!res.ok) {
         const errBody = await res.text().catch(() => "");
-        logger.warn(`Booking.com location API HTTP ${res.status} for "${term}": ${errBody.slice(0, 300)}`);
+        logger.warn(`Destination API HTTP ${res.status} for "${term}": ${errBody.slice(0, 300)}`);
         continue;
       }
       const data = await res.json();
-      const results: any[] = Array.isArray(data) ? data : [];
-      logger.log(`Location results for "${term}": ${results.length} found`);
+      const results: any[] = data?.data ?? [];
+      logger.log(`Destination results for "${term}": ${results.length} found`);
 
-      // Prefer city type, fall back to first result
+      if (results.length > 0) {
+        logger.log(`First result: ${JSON.stringify(results[0]).slice(0, 200)}`);
+      }
+
       const match =
-        results.find((r: any) => r.dest_type === "city") ?? results[0];
+        results.find((r: any) => r.search_type === "city" || r.dest_type === "city") ??
+        results[0];
 
-      if (match?.dest_id) {
-        logger.log(`Found destination: id=${match.dest_id} type=${match.dest_type} name=${match.name}`);
-        return { destId: String(match.dest_id), destType: match.dest_type };
+      if (match) {
+        const destId = match.dest_id ?? match.destId;
+        const searchType = match.search_type ?? match.dest_type ?? "city";
+        if (destId) {
+          logger.log(`Found destination: id=${destId} type=${searchType} label=${match.label ?? match.city_name ?? ""}`);
+          return { destId: String(destId), searchType };
+        }
       }
     } catch (e) {
       logger.warn(`Destination search failed for "${term}": ${e}`);
@@ -85,7 +93,7 @@ async function getDestination(
 
 async function searchHotels(
   destId: string,
-  destType: string,
+  searchType: string,
   checkIn: string,
   checkOut: string,
   apiKey: string
@@ -93,20 +101,16 @@ async function searchHotels(
   try {
     const params = new URLSearchParams({
       dest_id: destId,
-      dest_type: destType,
-      checkin_date: checkIn,
-      checkout_date: checkOut,
-      adults_number: "2",
-      room_number: "1",
-      order_by: "price",
-      locale: "en-us",
-      currency: "USD",
-      units: "metric",
-      filter_by_currency: "USD",
-      page_number: "0",
-      include_adjacency: "true",
+      search_type: searchType,
+      arrival_date: checkIn,
+      departure_date: checkOut,
+      adults: "2",
+      room_qty: "1",
+      page_number: "1",
+      currency_code: "USD",
+      languagecode: "en-us",
     });
-    const url = `https://${RAPIDAPI_HOST}/v1/hotels/search?${params}`;
+    const url = `https://${RAPIDAPI_HOST}/api/v1/hotels/searchHotels?${params}`;
     const res = await fetch(url, {
       headers: {
         "X-RapidAPI-Key": apiKey,
@@ -119,7 +123,12 @@ async function searchHotels(
       return [];
     }
     const data = await res.json();
-    return data?.result ?? [];
+    const hotels = data?.data?.hotels ?? data?.data ?? [];
+    logger.log(`Hotel search returned ${hotels.length} hotels`);
+    if (hotels.length > 0) {
+      logger.log(`First hotel sample: ${JSON.stringify(hotels[0]).slice(0, 300)}`);
+    }
+    return hotels;
   } catch (e) {
     logger.warn(`Hotel search failed: ${e}`);
     return [];
@@ -163,7 +172,6 @@ Hotel deal:
 - Price: $${deal.price}/night
 ${savings ? `- Savings: ${savings}` : ""}
 ${deal.rating ? `- Rating: ${deal.rating}/10 (${deal.reviewCount?.toLocaleString()} reviews)` : ""}
-${deal.amenities.length > 0 ? `- Amenities: ${deal.amenities.slice(0, 4).join(", ")}` : ""}
 - Booking link: ${deal.affiliateLink}
 
 Write one Facebook post. Follow these rules exactly:
@@ -262,6 +270,31 @@ async function postToFacebook(
   return data.id;
 }
 
+// ─── Extract price and rating from DataCrawler hotel object ───────────────────
+function extractHotelData(h: any): { price: number; rating: number; reviewCount: number } {
+  const price =
+    h.property?.priceBreakdown?.grossPrice?.value ??
+    h.property?.priceBreakdown?.strikethroughPrice?.value ??
+    h.priceBreakdown?.grossPrice?.value ??
+    h.min_total_price ??
+    h.price ??
+    0;
+
+  const rating =
+    h.property?.reviewScore ??
+    h.review_score ??
+    h.reviewScore ??
+    0;
+
+  const reviewCount =
+    h.property?.reviewCount ??
+    h.review_nr ??
+    h.reviewCount ??
+    0;
+
+  return { price: Math.round(price), rating, reviewCount };
+}
+
 // ─── Shared Run Logic ─────────────────────────────────────────────────────────
 async function runBotForLocation(location: string): Promise<void> {
   const rapidApiKey = process.env.RAPIDAPI_KEY;
@@ -289,36 +322,32 @@ async function runBotForLocation(location: string): Promise<void> {
   }
 
   // 2. Search hotels
-  const hotels = await searchHotels(destination.destId, destination.destType, checkIn, checkOut, rapidApiKey);
+  const hotels = await searchHotels(destination.destId, destination.searchType, checkIn, checkOut, rapidApiKey);
   if (hotels.length === 0) {
     logger.warn(`No hotels found for ${location} — falling back to generic discovery post`);
     await postGenericDiscovery(location, checkIn, checkOut, affId, aiClient, fbPageId, fbToken);
     return;
   }
-  logger.log(`Found ${hotels.length} hotels`);
 
-  // 3. Pick the best deal — lowest price with a rating ≥ 7 (Booking.com scores out of 10)
-  const rated = hotels.filter(
-    (h: any) => h.min_total_price && (h.review_score ?? 0) >= 7
-  );
-  const best = rated.length > 0
-    ? rated.sort((a: any, b: any) => a.min_total_price - b.min_total_price)[0]
-    : hotels.sort((a: any, b: any) => (a.min_total_price ?? 999999) - (b.min_total_price ?? 999999))[0];
+  // 3. Pick best deal — lowest price with rating ≥ 7
+  const withPrice = hotels.filter((h: any) => extractHotelData(h).price > 0);
+  const rated = withPrice.filter((h: any) => extractHotelData(h).rating >= 7);
+  const pool = rated.length > 0 ? rated : withPrice;
+  const best = pool.sort((a: any, b: any) => extractHotelData(a).price - extractHotelData(b).price)[0];
+
+  const { price, rating, reviewCount } = extractHotelData(best);
+  const name = best.property?.name ?? best.hotel_name ?? best.name ?? "Featured Hotel";
 
   const deal: HotelDeal = {
-    name: best.hotel_name ?? "Featured Hotel",
-    price: Math.round(best.min_total_price ?? 0),
-    rating: best.review_score,
-    reviewCount: best.review_nr,
+    name,
+    price,
+    rating,
+    reviewCount,
     amenities: [],
     affiliateLink: buildAffiliateLink(location, checkIn, checkOut, affId),
   };
 
-  logger.log("Best deal selected", {
-    hotel: deal.name,
-    price: deal.price,
-    rating: deal.rating,
-  });
+  logger.log("Best deal selected", { hotel: deal.name, price: deal.price, rating: deal.rating });
 
   // 4. Generate post
   const postText = await generateFacebookPost(deal, location, aiClient);
