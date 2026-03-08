@@ -172,18 +172,18 @@ Hotel deal:
 - Price: $${deal.price}/night
 ${savings ? `- Savings: ${savings}` : ""}
 ${deal.rating ? `- Rating: ${deal.rating}/10 (${deal.reviewCount?.toLocaleString()} reviews)` : ""}
-- Booking link: ${deal.affiliateLink}
 
 Write one Facebook post. Follow these rules exactly:
 
 1. NEVER use "You know that feeling" — not at the start, not anywhere. This phrase is banned.
 2. Use this opener style: ${openerStyle}
 3. Keep it conversational and genuine — like a friend texting you about a good find.
-4. Include the booking link at the end.
-5. 3–5 sentences max. No essays.
-6. 1–2 emojis only, placed naturally — do not overload.
-7. No hashtags.
-8. Make it feel specific to the Alabama Gulf Coast, not generic.
+4. Do NOT include any URLs or links — the booking link will be added as a comment.
+5. End with a natural call-to-action like "Link in the comments 👇" or "Grab it — link below."
+6. 3–5 sentences max. No essays.
+7. 1–2 emojis only, placed naturally — do not overload.
+8. No hashtags.
+9. Make it feel specific to the Alabama Gulf Coast, not generic.
 
 Output only the post text. Nothing else.`;
 
@@ -242,17 +242,42 @@ Output only the post text. Nothing else.`;
   }
 
   logger.log("Generated generic discovery post", { text });
-  const postId = await postToFacebook(text, fbPageId, fbToken);
+  const postId = await postToFacebook(text, fbPageId, fbToken, searchLink);
   logger.log("✅ Posted generic discovery post", { postId, location });
+}
+
+async function postComment(postId: string, link: string, fbToken: string): Promise<void> {
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${postId}/comments`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: `🔗 Book here: ${link}`,
+          access_token: fbToken,
+        }),
+      }
+    );
+    if (!res.ok) {
+      const err = await res.text();
+      logger.warn(`Comment post failed (${res.status}): ${err.slice(0, 200)}`);
+    } else {
+      logger.log("✅ Affiliate link posted as first comment");
+    }
+  } catch (e) {
+    logger.warn(`Comment post error: ${e}`);
+  }
 }
 
 async function postToFacebook(
   text: string,
   fbPageId: string,
   fbToken: string,
+  affiliateLink: string,
   photoUrl?: string | null
 ): Promise<string> {
-  // If we have a photo URL, post via /photos endpoint (shows image in post)
+  // If we have a photo URL, post via /photos endpoint then add link as first comment
   if (photoUrl) {
     logger.log(`Posting with photo: ${photoUrl}`);
     const res = await fetch(
@@ -273,11 +298,13 @@ async function postToFacebook(
       // Fall through to text-only post below
     } else {
       const data = await res.json();
-      return data.post_id ?? data.id;
+      const postId = data.post_id ?? data.id;
+      await postComment(postId, affiliateLink, fbToken);
+      return postId;
     }
   }
 
-  // Text-only fallback
+  // Text-only fallback — post message then add link as first comment
   const res = await fetch(
     `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${fbPageId}/feed`,
     {
@@ -294,7 +321,9 @@ async function postToFacebook(
     throw new Error(`Facebook API error ${res.status}: ${err}`);
   }
   const data = await res.json();
-  return data.id;
+  const postId = data.id;
+  await postComment(postId, affiliateLink, fbToken);
+  return postId;
 }
 
 // ─── Extract price, rating, and photo from DataCrawler hotel object ──────────
@@ -395,7 +424,7 @@ async function runBotForLocation(location: string): Promise<void> {
   logger.log("Generated post text", { postText });
 
   // 5. Post to Facebook (with photo if available)
-  const postId = await postToFacebook(postText, fbPageId, fbToken, photoUrl);
+  const postId = await postToFacebook(postText, fbPageId, fbToken, deal.affiliateLink, photoUrl);
   logger.log(`✅ Posted to Facebook`, { postId, location, hasPhoto: !!photoUrl });
 }
 
